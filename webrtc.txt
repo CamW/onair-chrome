@@ -1,0 +1,456 @@
+// Web rtc working version
+
+// content.js
+console.log('WebRTC Detector: Content script running');
+
+// Create a connection to the background script
+const channel = chrome.runtime.connect();
+
+// Inject the script that will monitor WebRTC activities
+const injectScript = () => {
+  const s = document.createElement('script');
+  s.src = chrome.runtime.getURL('scripts/injected.js');
+  (document.head || document.documentElement).appendChild(s);
+  s.onload = function() {
+    s.remove();
+  };
+};
+
+// Listen for messages from the injected script
+window.addEventListener('message', function(event) {
+  if (typeof(event.data) === 'string') return;
+  if (!Array.isArray(event.data) || event.data[0] !== 'WebRTCSnoop') return;
+  
+  // Forward the message to the background script
+  channel.postMessage(event.data);
+  console.log('WebRTC activity detected:', event.data[2]);
+});
+
+// Inject the script when the content script loads
+injectScript();
+
+// scripts/injected.js
+console.log('WebRTC Detector: Injected script running');
+
+// Hook into RTCPeerConnection methods to detect WebRTC usage
+const rtcMethods = [
+  'createOffer', 
+  'createAnswer',
+  'setLocalDescription', 
+  'setRemoteDescription'
+];
+
+rtcMethods.forEach(function(method) {
+  if (!RTCPeerConnection || !RTCPeerConnection.prototype[method]) return;
+  
+  const nativeMethod = RTCPeerConnection.prototype[method];
+  RTCPeerConnection.prototype[method] = function() {
+    // Send message to content script
+    window.postMessage(['WebRTCSnoop', window.location.href, method], '*');
+    
+    // Add ice candidate listener
+    if (!this._iceListenerAdded) {
+      this.addEventListener('icecandidate', function(event) {
+        if (event.candidate) {
+          window.postMessage(['WebRTCSnoop', window.location.href, 'iceCandidate'], '*');
+        }
+      });
+      this._iceListenerAdded = true;
+    }
+    
+    // Call the original method
+    return nativeMethod.apply(this, arguments);
+  };
+});// manifest.json
+{
+  "manifest_version": 3,
+  "name": "WebRTC Call Detector",
+  "version": "1.0",
+  "description": "Detects when a user is in a WebRTC video call",
+  "permissions": ["activeTab", "scripting", "tabs"],
+  "host_permissions": ["<all_urls>"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "images/icon16.png",
+      "48": "images/icon48.png",
+      "128": "images/icon128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"]
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["scripts/injected.js"],
+      "matches": ["<all_urls>"],
+      "use_dynamic_url": false
+    }
+  ],
+  "icons": {
+    "16": "images/icon16.png",
+    "48": "images/icon48.png",
+    "128": "images/icon128.png"
+  }
+}
+
+// background.js
+let isInCall = false;
+let activeWebRTCTabs = new Map(); // Track tabs with active WebRTC
+
+// Update the extension icon based on call state
+function updateIcon() {
+  const iconPath = isInCall 
+    ? {
+        "16": "images/icon16_active.png",
+        "48": "images/icon48_active.png",
+        "128": "images/icon128_active.png"
+      }
+    : {
+        "16": "images/icon16.png",
+        "48": "images/icon48.png",
+        "128": "images/icon128.png"
+      };
+  
+  chrome.action.setIcon({ path: iconPath });
+}
+
+// Initialize when extension is loaded
+chrome.runtime.onInstalled.addListener(() => {
+  // Create necessary folders structure
+  console.log('WebRTC Detector extension installed');
+  
+  // Set initial state
+  updateIcon();
+});
+
+// Listen for WebRTC activity from content scripts
+chrome.runtime.onConnect.addListener((port) => {
+  port.onMessage.addListener((message) => {
+    if (Array.isArray(message) && message[0] === 'WebRTCSnoop') {
+      const tabId = port.sender.tab.id;
+      const url = message[1];
+      const method = message[2];
+      
+      console.log(`WebRTC activity detected in tab ${tabId} (${url}): ${method}`);
+      
+      // Mark this tab as having active WebRTC
+      activeWebRTCTabs.set(tabId, {
+        url: url,
+        lastActivity: Date.now(),
+        method: method
+      });
+      
+      // Update overall call status
+      const wasInCall = isInCall;
+      isInCall = activeWebRTCTabs.size > 0;
+      
+      if (wasInCall !== isInCall) {
+        updateIcon();
+        
+        // Notify popup if open
+        chrome.runtime.sendMessage({
+          action: "callStateChanged",
+          inCall: isInCall,
+          activeTabs: Array.from(activeWebRTCTabs.keys()).length
+        });
+      }
+    }
+  });
+  
+  // Remove tab from tracking when disconnected
+  port.onDisconnect.addListener(() => {
+    const tabId = port.sender.tab.id;
+    if (activeWebRTCTabs.has(tabId)) {
+      activeWebRTCTabs.delete(tabId);
+      
+      // Update overall status
+      const wasInCall = isInCall;
+      isInCall = activeWebRTCTabs.size > 0;
+      
+      if (wasInCall !== isInCall) {
+        updateIcon();
+        
+        chrome.runtime.sendMessage({
+          action: "callStateChanged",
+          inCall: isInCall,
+          activeTabs: Array.from(activeWebRTCTabs.keys()).length
+        });
+      }
+    }
+  });
+});
+
+// Handle tab closure
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (activeWebRTCTabs.has(tabId)) {
+    activeWebRTCTabs.delete(tabId);
+    
+    // Update overall status
+    const wasInCall = isInCall;
+    isInCall = activeWebRTCTabs.size > 0;
+    
+    if (wasInCall !== isInCall) {
+      updateIcon();
+      
+      chrome.runtime.sendMessage({
+        action: "callStateChanged",
+        inCall: isInCall,
+        activeTabs: Array.from(activeWebRTCTabs.keys()).length
+      });
+    }
+  }
+});
+
+// Handle messages from popup
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.action === "getCallStatus") {
+    sendResponse({ 
+      inCall: isInCall,
+      activeTabs: Array.from(activeWebRTCTabs.keys()).length,
+      details: Array.from(activeWebRTCTabs.entries()).map(([tabId, data]) => {
+        return {
+          tabId: tabId,
+          url: data.url,
+          lastActivity: data.lastActivity,
+          method: data.method
+        };
+      })
+    });
+  }
+});
+
+// popup.html
+<!DOCTYPE html>
+<html>
+<head>
+  <title>WebRTC Call Detector</title>
+  <style>
+    body {
+      width: 300px;
+      padding: 15px;
+      font-family: Arial, sans-serif;
+      margin: 0;
+    }
+    
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 15px;
+      border-bottom: 1px solid #eee;
+      padding-bottom: 10px;
+    }
+    
+    .status {
+      font-size: 16px;
+      display: flex;
+      align-items: center;
+    }
+    
+    .indicator {
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      display: inline-block;
+      margin-right: 10px;
+    }
+    
+    .active {
+      background-color: #4CAF50;
+    }
+    
+    .inactive {
+      background-color: #F44336;
+    }
+    
+    .refresh-button {
+      background: none;
+      border: none;
+      cursor: pointer;
+      color: #2196F3;
+      font-size: 20px;
+    }
+    
+    .refresh-button:hover {
+      color: #0b7dda;
+    }
+    
+    .details-container {
+      margin-top: 15px;
+      border-top: 1px solid #eee;
+      padding-top: 10px;
+      display: none;
+    }
+    
+    .details-heading {
+      font-weight: bold;
+      margin-bottom: 8px;
+    }
+    
+    .details-list {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+    }
+    
+    .detail-item {
+      padding: 8px;
+      border-radius: 4px;
+      background-color: #f5f5f5;
+      margin-bottom: 6px;
+    }
+    
+    .detail-url {
+      font-weight: bold;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    
+    .detail-info {
+      display: flex;
+      justify-content: space-between;
+      font-size: 12px;
+      color: #666;
+      margin-top: 4px;
+    }
+    
+    .no-activity {
+      color: #666;
+      font-style: italic;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="status">
+      <span id="indicator" class="indicator inactive"></span>
+      <span id="statusText">Checking WebRTC status...</span>
+    </div>
+    <button id="refreshButton" class="refresh-button" title="Refresh status">⟳</button>
+  </div>
+  
+  <div>
+    <p>This extension detects when a page is using WebRTC APIs, which typically indicates audio/video calling functionality.</p>
+  </div>
+  
+  <div id="detailsContainer" class="details-container">
+    <div class="details-heading">Active WebRTC Sessions:</div>
+    <ul id="detailsList" class="details-list"></ul>
+  </div>
+  
+  <script src="popup.js"></script>
+</body>
+</html>
+
+// popup.js
+document.addEventListener('DOMContentLoaded', () => {
+  updateStatus();
+  
+  // Listen for status updates
+  chrome.runtime.onMessage.addListener((message) => {
+    if (message.action === "callStateChanged") {
+      updateUI(message.inCall, message.activeTabs || 0);
+    }
+  });
+  
+  // Add refresh button functionality
+  document.getElementById('refreshButton').addEventListener('click', () => {
+    updateStatus();
+  });
+});
+
+function updateStatus() {
+  chrome.runtime.sendMessage(
+    { action: "getCallStatus" },
+    (response) => {
+      if (response) {
+        updateUI(response.inCall, response.activeTabs || 0);
+        
+        // Update details section if available
+        if (response.details && response.details.length > 0) {
+          showDetails(response.details);
+        } else {
+          hideDetails();
+        }
+      }
+    }
+  );
+}
+
+function updateUI(inCall, activeTabs) {
+  const indicator = document.getElementById('indicator');
+  const statusText = document.getElementById('statusText');
+  
+  if (inCall) {
+    indicator.className = 'indicator active';
+    statusText.textContent = `WebRTC active in ${activeTabs} tab${activeTabs !== 1 ? 's' : ''}`;
+  } else {
+    indicator.className = 'indicator inactive';
+    statusText.textContent = 'No WebRTC activity detected';
+  }
+}
+
+function showDetails(details) {
+  const detailsContainer = document.getElementById('detailsContainer');
+  const detailsList = document.getElementById('detailsList');
+  
+  // Clear previous details
+  detailsList.innerHTML = '';
+  
+  // Add each active tab to the list
+  details.forEach(item => {
+    const listItem = document.createElement('li');
+    
+    // Format the URL to be more readable
+    let displayUrl = item.url;
+    try {
+      const urlObj = new URL(item.url);
+      displayUrl = urlObj.hostname;
+    } catch (e) {
+      // Keep original if parsing fails
+    }
+    
+    // Format time
+    const timeAgo = getTimeAgo(item.lastActivity);
+    
+    listItem.innerHTML = `
+      <div class="detail-item">
+        <div class="detail-url" title="${item.url}">${displayUrl}</div>
+        <div class="detail-info">
+          <span class="detail-method">${item.method}</span>
+          <span class="detail-time">${timeAgo}</span>
+        </div>
+      </div>
+    `;
+    
+    detailsList.appendChild(listItem);
+  });
+  
+  detailsContainer.style.display = 'block';
+}
+
+function hideDetails() {
+  document.getElementById('detailsContainer').style.display = 'none';
+}
+
+function getTimeAgo(timestamp) {
+  const seconds = Math.floor((Date.now() - timestamp) / 1000);
+  
+  if (seconds < 60) {
+    return 'just now';
+  } else if (seconds < 3600) {
+    const minutes = Math.floor(seconds / 60);
+    return `${minutes}m ago`;
+  } else {
+    const hours = Math.floor(seconds / 3600);
+    return `${hours}h ago`;
+  }
+}
